@@ -145,7 +145,16 @@ class EngineBuilder:
             print("Output '{}' with shape {} and dtype {}".format(output.name, output.shape, output.dtype))
         assert self.batch_size > 0
         # self.builder.max_batch_size = self.batch_size  # This no effect for networks created with explicit batch dimension mode. Also DEPRECATED.
+        # Check if the ONNX model already contains an NMS-like structure.
+        output_names = {o.name for o in outputs}
+        # A set of expected output names after NMS plugin is added
+        expected_post_nms_names = {"num_dets", "det_boxes", "det_scores", "det_classes"}
 
+        if end2end and expected_post_nms_names.issubset(output_names):
+            log.info("Detected that the ONNX model already contains post-processing (NMS).")
+            log.info("The script will build the engine directly from this ONNX graph without adding another NMS plugin.")
+            # The outputs are already marked from the ONNX parser, so no further action is needed.
+            return
         if v10:
             try:
                 for previous_output in outputs:
@@ -220,6 +229,30 @@ class EngineBuilder:
                 # scores = self.network.add_reduce(class_scores.get_output(0), op=trt.ReduceOperation.MAX, axes=1 << 2,  keep_dims=True)
             else:
                 # output [1, 8400, 85]
+                # Check if the output is 2D and needs reshaping
+                if len(previous_output.shape) == 2:
+                    log.info(f"Detected 2D raw output shape {previous_output.shape}. Adding reshape layer.")
+                    bs = self.network.get_input(0).shape[0]
+                    flattened_dim = previous_output.shape[1]
+                    shuffle_layer = self.network.add_shuffle(previous_output)
+                    
+                    num_attributes = -1
+                    # Try to infer number of attributes based on standard YOLO anchor counts
+                    if flattened_dim % 25200 == 0:
+                        num_attributes = flattened_dim // 25200
+                        log.info(f"Inferred num_attributes: {num_attributes} based on 25200 predictions.")
+                    elif flattened_dim % 18900 == 0: # yolov7-tiny
+                        num_attributes = flattened_dim // 18900
+                        log.info(f"Inferred num_attributes: {num_attributes} based on 18900 predictions.")
+                    else:
+                        raise ValueError(f"Could not infer model structure from flattened output shape {previous_output.shape}. "
+                                         f"Please ensure the ONNX model has a 3D output or add logic to handle this specific shape.")
+
+                    shuffle_layer.reshape_dims = (bs, -1, num_attributes)
+                    previous_output = shuffle_layer.get_output(0)
+                    log.info(f"Reshaped output to: {previous_output.shape}")
+
+                bs, num_boxes, temp = previous_output.shape
                 # slice boxes, obj_score, class_scores
                 strides = trt.Dims([1,1,1])
                 starts = trt.Dims([0,0,0])
